@@ -1,430 +1,157 @@
+"""Консольная точка входа: python agent/agent_cli.py."""
 
-"""Консольный интерфейс AI Agent PRO."""
-
+import asyncio
 import logging
+import re
 import sys
 from uuid import uuid4
+from pathlib import Path
 
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 
-from config import API_KEY, DEFAULT_MODEL, MODELS, DATA
-from knowledge import (
-    create_knowledge,
-    add_path,
-    add_url,
-    seed_knowledge,
-    import_documents,
-)
 from agent import create_agent
+from config import API_KEY, DATA, DEFAULT_MODEL, MODELS
+from knowledge import create_knowledge, seed_knowledge
+from config import DOCS
+from sandbox_client import initialize_sandbox, sanitize_local_document
 from openrouter_free_models import get_free_models
 
-
 console = Console()
-
 logging.basicConfig(
     filename=DATA / "agent.log",
     level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-HELP = """
-[bold cyan]Команды AI Agent PRO[/bold cyan]
-
-[bold]Модели:[/bold]
-/models            Сохранённый список моделей
-/models-live       Актуальные бесплатные модели OpenRouter
-/model НОМЕР       Выбрать модель по номеру
-/model MODEL_ID    Выбрать модель по полному ID
-
-[bold]Сессии:[/bold]
-/new               Создать новую сессию
-/session ID        Открыть сохранённую сессию
-/id                Показать текущую сессию
-
-[bold]База знаний:[/bold]
-/add ПУТЬ          Добавить PDF/DOCX/TXT/MD/CSV
-/url HTTPS_URL     Добавить документ по ссылке
-/docs              Импортировать файлы из documents/
-/seed              Загрузить документацию Agno
-
-[bold]Прочее:[/bold]
-/help              Показать команды
-/exit              Завершить работу
+HELP = """[bold]Команды[/bold]
+/help                 показать команды
+/models               встроенные модели
+/models-live          актуальные бесплатные модели OpenRouter
+/model 9              выбрать модель по номеру
+/model MODEL_ID       выбрать модель по ID
+/new                  новая сессия
+/session ИМЯ          открыть сессию
+/id                   текущая сессия
+/add ПУТЬ             безопасно добавить PDF/DOCX/TXT/MD/CSV
+/docs                 загрузить файлы из agent/documents
+/seed                 добавить документацию Agno
+/exit                 выход
 """
 
 
-def show_models():
-    """Показать сохранённый список моделей."""
-
-    console.print(
-        "\n[bold cyan]Доступные модели:[/bold cyan]\n"
-    )
-
-    for number, (name, model_id) in MODELS.items():
-        console.print(
-            f"[bold green]{number:>2}.[/bold green] "
-            f"{name}\n"
-            f"    [dim]{model_id}[/dim]"
-        )
-
-
-def show_live_models():
-    """Получить актуальные бесплатные модели OpenRouter."""
-
-    with console.status(
-        "[cyan]Получаю модели OpenRouter...[/cyan]"
-    ):
-        models = get_free_models()
-
-    if not models:
-        console.print(
-            "[yellow]Бесплатные модели не найдены.[/yellow]"
-        )
-        return
-
-    console.print(
-        f"\n[bold green]Найдено моделей: "
-        f"{len(models)}[/bold green]\n"
-    )
-
-    for number, (name, model_id, context) in enumerate(
-        models, start=1
-    ):
-        console.print(
-            f"[bold cyan]{number:>2}.[/bold cyan] "
-            f"{name}\n"
-            f"    [dim]ID: {model_id}[/dim]\n"
-            f"    [dim]Контекст: {context:,}[/dim]"
-        )
-
-    console.print(
-        "\n[dim]Для выбора модели используй "
-        "/model MODEL_ID[/dim]"
-    )
-
-
-def resolve_model(value):
-    """Определить ID модели по номеру или строке."""
-
-    value = value.strip()
-
-    if not value:
-        raise ValueError(
-            "Укажи номер модели или полный MODEL_ID."
-        )
-
+def resolve_model(value: str) -> str:
     if value in MODELS:
         return MODELS[value][1]
-
-    if (
-        "/" in value
-        and value.endswith(":free")
-        and not any(char.isspace() for char in value)
-    ):
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+:free", value):
         return value
-
-    raise ValueError(
-        "Некорректная модель. "
-        "Используй /models или /models-live."
-    )
+    raise ValueError("Укажи номер из /models или MODEL_ID:free")
 
 
-def show_answer(response):
-    """Отобразить ответ модели."""
-
-    answer = getattr(response, "content", None)
-
-    if isinstance(answer, str) and answer.strip():
-        console.print(
-            Panel(
-                Markdown(answer),
-                title="[bold green]Ассистент[/bold green]",
-                border_style="green",
-                padding=(1, 2),
-            )
-        )
-    elif answer is not None:
-        console.print(
-            Panel(
-                str(answer),
-                title="Ассистент",
-                border_style="green",
-            )
-        )
-    else:
-        console.print(
-            "[yellow]Модель не вернула текст. "
-            "Попробуй другую через /model.[/yellow]"
-        )
-
-
-def main():
-    """Основной цикл приложения."""
-
+def main() -> int:
     if not API_KEY:
-        console.print(
-            "[bold red]Ошибка:[/bold red] "
-            "В .env отсутствует OPENROUTER_API_KEY"
-        )
+        console.print("[red]В agent/.env не указан OPENROUTER_API_KEY[/red]")
         return 1
-
-    console.print(
-        Panel(
-            "[bold cyan]AI Agent PRO v2.0[/bold cyan]\n"
-            "[white]Agno + OpenRouter + RAG[/white]\n\n"
-            "[dim]/help — список команд[/dim]",
-            title="[bold green]Агент готов[/bold green]",
-            border_style="cyan",
-        )
-    )
-
+    console.print(Panel("AI Agent PRO v3.1 | Agno + OpenRouter + RAG\n/help — команды", title="Готов к работе"))
     try:
-        with console.status(
-            "[cyan]Инициализация базы знаний...[/cyan]"
-        ):
+        with console.status("Открываю базу знаний CLI..."):
             knowledge = create_knowledge()
-
     except Exception as exc:
         logging.exception("Ошибка базы знаний")
-
-        console.print(
-            f"[red]Не удалось открыть базу знаний: "
-            f"{exc}[/red]"
-        )
+        console.print(f"[red]Ошибка базы знаний: {exc}[/red]")
         return 1
 
+    initialize_sandbox()
     session_id = "main"
     model_id = DEFAULT_MODEL
-
-    try:
-        agent = create_agent(
-            knowledge,
-            session_id,
-            model_id,
-        )
-
-    except Exception as exc:
-        logging.exception("Ошибка создания агента")
-        console.print(
-            f"[red]Не удалось создать агента: "
-            f"{exc}[/red]"
-        )
-        return 1
-
-    console.print(
-        f"\n[green]Модель:[/green] {model_id}\n"
-        f"[green]Сессия:[/green] {session_id}"
-    )
+    agent = create_agent(knowledge, session_id, model_id)
+    console.print(f"[dim]Модель: {model_id} | Сессия: {session_id}[/dim]")
 
     while True:
         try:
-            line = Prompt.ask(
-                "\n[bold cyan]Вы[/bold cyan]"
-            ).strip()
-
-        except (KeyboardInterrupt, EOFError):
-            console.print(
-                "\n[cyan]До встречи![/cyan]"
-            )
+            line = Prompt.ask("\n[cyan]Вы[/cyan]").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\nДо встречи!")
             break
-
         if not line:
             continue
-
         command, _, arg = line.partition(" ")
         cmd = command.lower()
         arg = arg.strip()
-
         try:
-
             if cmd in ("/exit", "/quit", "выход"):
-                console.print(
-                    "[cyan]Завершение работы агента.[/cyan]"
-                )
                 break
-
             elif cmd == "/help":
                 console.print(HELP)
-
             elif cmd == "/models":
-                show_models()
-
+                for number, (name, ident) in MODELS.items():
+                    console.print(f"{number:>2}. {name} [dim]{ident}[/dim]")
             elif cmd == "/models-live":
-                show_live_models()
-
+                with console.status("Запрашиваю список OpenRouter..."):
+                    models = get_free_models()
+                console.print(f"Найдено: {len(models)}")
+                for name, ident, context in models:
+                    console.print(f"{name} [dim]{ident} | {context:,}[/dim]")
             elif cmd == "/model":
-                try:
-                    new_model_id = resolve_model(arg)
-
-                    new_agent = create_agent(
-                        knowledge,
-                        session_id,
-                        new_model_id,
-                    )
-
-                    agent = new_agent
-                    model_id = new_model_id
-
-                    console.print(
-                        f"[bold green]Модель выбрана:"
-                        f"[/bold green] {model_id}"
-                    )
-
-                except ValueError as exc:
-                    console.print(
-                        f"[yellow]{exc}[/yellow]"
-                    )
-
+                new_id = resolve_model(arg)
+                agent = create_agent(knowledge, session_id, new_id)
+                model_id = new_id
+                console.print(f"[green]Модель: {model_id}[/green]")
             elif cmd == "/new":
-                new_session_id = uuid4().hex[:12]
-
-                agent = create_agent(
-                    knowledge,
-                    new_session_id,
-                    model_id,
-                )
-
-                session_id = new_session_id
-
-                console.print(
-                    f"[green]Новая сессия: "
-                    f"{session_id}[/green]"
-                )
-
+                new_id = uuid4().hex[:12]
+                agent = create_agent(knowledge, new_id, model_id)
+                session_id = new_id
+                console.print(f"[green]Новая сессия: {session_id}[/green]")
             elif cmd == "/session":
-                if (
-                    not arg
-                    or len(arg) > 100
-                    or not all(
-                        c.isalnum() or c in "-_"
-                        for c in arg
-                    )
-                ):
-                    console.print(
-                        "[yellow]Укажи ID сессии: "
-                        "буквы, цифры, - или _[/yellow]"
-                    )
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", arg):
+                    console.print("[yellow]Укажи ID: латинские буквы, цифры, - или _[/yellow]")
                     continue
-
-                new_agent = create_agent(
-                    knowledge,
-                    arg,
-                    model_id,
-                )
-
-                agent = new_agent
+                agent = create_agent(knowledge, arg, model_id)
                 session_id = arg
-
-                console.print(
-                    f"[green]Сессия: "
-                    f"{session_id}[/green]"
-                )
-
+                console.print(f"[green]Сессия: {session_id}[/green]")
             elif cmd == "/id":
-                console.print(
-                    f"[cyan]Текущая сессия:[/cyan] "
-                    f"[bold]{session_id}[/bold]"
-                )
-
+                console.print(f"ID: {session_id}")
             elif cmd == "/add":
                 if not arg:
-                    console.print(
-                        "[yellow]Используй: "
-                        "/add путь_к_файлу[/yellow]"
-                    )
+                    console.print("[yellow]Используй /add ПУТЬ[/yellow]")
                     continue
-
-                with console.status(
-                    "[cyan]Индексирую документ...[/cyan]"
-                ):
-                    result = add_path(
-                        knowledge,
-                        arg.strip('"'),
-                    )
-
-                console.print(
-                    f"[green]Документ добавлен: "
-                    f"{result}[/green]"
-                )
-
-            elif cmd == "/url":
-                if not arg:
-                    console.print(
-                        "[yellow]Используй: "
-                        "/url https://...[/yellow]"
-                    )
-                    continue
-
-                with console.status(
-                    "[cyan]Загружаю источник...[/cyan]"
-                ):
-                    result = add_url(
-                        knowledge,
-                        arg,
-                    )
-
-                console.print(
-                    f"[green]Источник добавлен: "
-                    f"{result}[/green]"
-                )
-
-            elif cmd == "/seed":
-                with console.status(
-                    "[cyan]Загружаю документацию "
-                    "Agno...[/cyan]"
-                ):
-                    seed_knowledge(knowledge)
-
-                console.print(
-                    "[green]Документация Agno "
-                    "проиндексирована.[/green]"
-                )
-
+                with console.status("Изолированно обрабатываю и индексирую файл..."):
+                    src = Path(arg.strip('"'))
+                    text, pages = asyncio.run(sanitize_local_document(src))
+                    knowledge.insert(text_content=text, name=src.name)
+                console.print(f"[green]Добавлен: {src.name}[/green]")
             elif cmd == "/docs":
-                with console.status(
-                    "[cyan]Индексирую документы...[/cyan]"
-                ):
-                    count = import_documents(
-                        knowledge
-                    )
-
-                console.print(
-                    f"[green]Обработано файлов: "
-                    f"{count}[/green]"
-                )
-
+                count = 0
+                with console.status("Обрабатываю документы в изоляции..."):
+                    for src in sorted(DOCS.iterdir()):
+                        if src.is_file() and src.suffix.lower() in ('.pdf', '.docx', '.txt', '.md', '.csv'):
+                            text, pages = asyncio.run(sanitize_local_document(src))
+                            knowledge.insert(text_content=text, name=src.name, skip_if_exists=True)
+                            count += 1
+                console.print(f"[green]Обработано: {count}[/green]")
+            elif cmd == "/seed":
+                with console.status("Загружаю документацию Agno..."):
+                    seed_knowledge(knowledge)
+                console.print("[green]Документация проиндексирована.[/green]")
             elif cmd.startswith("/"):
-                console.print(
-                    "[yellow]Неизвестная команда. "
-                    "Используй /help[/yellow]"
-                )
-
+                console.print("[yellow]Неизвестная команда. /help[/yellow]")
             else:
-                with console.status(
-                    "[cyan]Агент думает...[/cyan]"
-                ):
+                with console.status("Агент думает..."):
                     response = agent.run(line)
-
-                show_answer(response)
-
+                answer = getattr(response, "content", None)
+                console.print(
+                    Panel(
+                        Markdown(answer, code_theme="monokai", hyperlinks=True) if isinstance(answer, str) and answer.strip() else "Модель не вернула текст.",
+                        title="Ассистент",
+                        border_style="green",
+                    )
+                )
         except Exception as exc:
-            logging.exception(
-                "Ошибка выполнения операции"
-            )
-
-            console.print(
-                f"[bold red]Ошибка:[/bold red] "
-                f"{exc}"
-            )
-
-            console.print(
-                "[dim]Подробности записаны "
-                "в data/agent.log[/dim]"
-            )
-
+            logging.exception("Ошибка операции")
+            console.print(f"[red]Ошибка: {exc}[/red]")
+            console.print("[dim]Подробности: agent/data/agent.log[/dim]")
     return 0
 
 
