@@ -12,8 +12,8 @@ from pathlib import Path
 from docx import Document
 from pypdf import PdfReader
 
-INPUT = Path('/work/inbox')
-OUTPUT = Path('/work/outbox')
+INPUT = Path('/input/data.bin')
+OUTPUT = Path('/output')
 MAX_BYTES = 8 * 1024 * 1024
 MAX_CHARS = 250_000
 MAX_PAGES = 120
@@ -128,33 +128,25 @@ def parse(path: Path, ext: str) -> tuple[str, int]:
 
 
 def main():
-    job_id = sys.argv[1]
-    if not re.fullmatch(r'[a-f0-9]{32}', job_id):
-        raise SystemExit('Invalid job ID')
-    raw_path = INPUT / f'{job_id}.bin'
-    job_path = INPUT / f'{job_id}.json'
-    result_path = OUTPUT / f'{job_id}.json'
-    text_path = OUTPUT / f'{job_id}.txt'
+    if len(sys.argv) != 2 or sys.argv[1] not in EXTS:
+        raise SystemExit('Invalid file type')
+    ext = sys.argv[1]
+    result_path = OUTPUT / 'result.json'
+    text_path = OUTPUT / 'content.txt'
     try:
-        # File name and content never influence filesystem paths.
-        job = json.loads(job_path.read_text(encoding='utf-8'))
-        ext = job.get('ext')
-        if ext not in EXTS:
-            raise DocumentRejected('Неподдерживаемый формат')
-        if raw_path.is_symlink() or not raw_path.is_file():
-            raise DocumentRejected('Некорректный файл в карантине')
-        if raw_path.stat().st_size > MAX_BYTES or raw_path.stat().st_size == 0:
-            raise DocumentRejected('Файл пустой или больше лимита')
-        text, pages = parse(raw_path, ext)
-        temp = text_path.with_suffix('.txt.tmp')
+        if INPUT.is_symlink() or not INPUT.is_file():
+            raise DocumentRejected('Некорректный файл карантина')
+        if not 0 < INPUT.stat().st_size <= MAX_BYTES:
+            raise DocumentRejected('Файл пустой или превышает 8 МБ')
+        text, pages = parse(INPUT, ext)
+        temp = OUTPUT / 'content.tmp'
         temp.write_text(text, encoding='utf-8')
         os.replace(temp, text_path)
         result = {'status': 'ok', 'pages': pages, 'characters': len(text)}
     except Exception as exc:
-        # No stack traces or raw content are returned to the bot.
         reason = str(exc) if isinstance(exc, DocumentRejected) else 'Не удалось безопасно обработать документ'
         result = {'status': 'error', 'error': reason[:180]}
-    temp = result_path.with_suffix('.json.tmp')
+    temp = OUTPUT / 'result.tmp'
     temp.write_text(json.dumps(result, ensure_ascii=False), encoding='utf-8')
     os.replace(temp, result_path)
 

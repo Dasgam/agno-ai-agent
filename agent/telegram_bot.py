@@ -11,6 +11,7 @@ import re
 import sqlite3
 from contextlib import closing, suppress
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -28,6 +29,7 @@ from telegram.ext import (
 
 from agent import create_agent
 from config import (
+    DOCUMENT_RETENTION_DAYS,
     API_KEY,
     DATA,
     DEFAULT_MODEL,
@@ -36,9 +38,12 @@ from config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_OWNER_IDS,
 )
-from knowledge import SUPPORTED, create_user_knowledge
+from knowledge import SUPPORTED, create_user_knowledge, delete_document_vectors
 from sandbox_client import INBOX, initialize_sandbox, sandbox_online, extract_isolated
 from telegram_render import telegram_html_parts
+from telegram_guard import requests_missing_document
+from document_retrieval import excerpt_for_question
+from document_cleanup import delete_owned_document
 from telegram.constants import ParseMode
 
 STATE_FILE = DATA / "telegram_state.sqlite3"
@@ -53,6 +58,7 @@ TELEGRAM_PART_LENGTH = 2_800
 MAX_RAG_CONTEXT = 13_000
 MAX_DAILY_MESSAGES = 60
 MAX_DAILY_UPLOADS = 10
+MAX_SENT_PARTS = 24
 
 
 class RedactBotToken(logging.Filter):
@@ -253,6 +259,48 @@ def save_document(user_id: int, document: DocInfo) -> None:
     update_state(user_id, active_doc_id=document.doc_id)
 
 
+def remove_document(user_id: int, doc_id: str) -> bool:
+    """Ownership-scoped cleanup; index is removed before local metadata."""
+    return delete_owned_document(STATE_FILE, TEXT_DIR, user_id, doc_id, delete_document_vectors)
+
+
+def expired_document_ids() -> list[tuple[int, str]]:
+    if DOCUMENT_RETENTION_DAYS == 0:
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=DOCUMENT_RETENTION_DAYS)
+    with closing(connect_db()) as con:
+        return con.execute(
+            "SELECT user_id, doc_id FROM telegram_documents WHERE created_at < ?",
+            (cutoff.strftime("%Y-%m-%d %H:%M:%S"),),
+        ).fetchall()
+
+
+async def retention_loop() -> None:
+    """Deletion shares per-user locks with chat, uploads and manual deletion."""
+    while True:
+        expired = await asyncio.to_thread(expired_document_ids)
+        for uid, doc_id in expired:
+            async with user_lock(uid):
+                try:
+                    await asyncio.to_thread(remove_document, uid, doc_id)
+                except Exception:
+                    logger.warning("Could not purge expired document for user %s", uid)
+        await asyncio.sleep(3600)
+
+
+async def post_init(application: Application) -> None:
+    await register_commands(application)
+    application.bot_data["retention_task"] = asyncio.create_task(retention_loop())
+
+
+async def post_stop(application: Application) -> None:
+    task = application.bot_data.pop("retention_task", None)
+    if task is not None:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
 def ingest_clean_text(user_id: int, original_name: str, text: str, pages: int, doc_id: str, size: int) -> DocInfo:
     """Indexes plain UTF-8 text; NEVER re-parses the uploaded binary on the bot host."""
     text_file = TEXT_DIR / str(user_id) / f"{doc_id}.txt"
@@ -269,42 +317,17 @@ def ingest_clean_text(user_id: int, original_name: str, text: str, pages: int, d
         )
         save_document(user_id, info)
     except Exception:
+        try:
+            delete_document_vectors(user_id, doc_id)
+        except Exception:
+            logger.error("Document index rollback failed for user %s", user_id)
         text_file.unlink(missing_ok=True)
         raise
     return info
 
 
 def local_retrieval(text: str, question: str) -> str:
-    """Фолбэк: фрагменты строго из выбранного PDF, даже если RAG-поиск недоступен."""
-    tokens = {
-        word for word in re.findall(r"[\wа-яё]{4,}", question.lower())
-        if word not in {
-            "файл", "файле", "файла", "этого", "данном", "каком", "чем", "кратко",
-            "расскажи", "лекция", "лекции", "документ", "документа", "содержание",
-            "пожалуйста", "подробно", "основные", "проанализируй", "изложи",
-        }
-    }
-    blocks = [text[i:i + 1600] for i in range(0, len(text), 1600)]
-    if not blocks:
-        return ""
-
-    selected = [0]
-    if len(blocks) >= 6:
-        selected.append(len(blocks) // 2)
-        selected.append(len(blocks) - 1)
-    if tokens:
-        ranking = sorted(
-            range(len(blocks)),
-            key=lambda index: sum(blocks[index].lower().count(token) for token in tokens),
-            reverse=True,
-        )
-        selected.extend(ranking[:6])
-    else:
-        selected.extend(range(min(len(blocks), 6)))
-
-    unique = list(dict.fromkeys(selected))
-    result = "\n\n…\n\n".join(blocks[index] for index in unique)
-    return result[:MAX_RAG_CONTEXT]
+    return excerpt_for_question(text, question, limit=MAX_RAG_CONTEXT)
 
 
 def get_document_context(user_id: int, info: DocInfo, question: str) -> str:
@@ -354,7 +377,9 @@ def ask_agent(user_id: int, question: str, session_id: str, model_id: str, info:
 
 async def send_markdown(message, answer: str) -> None:
     """Telegram does not parse rich Markdown directly: safe HTML is used."""
-    for part in telegram_html_parts(answer, limit=TELEGRAM_PART_LENGTH)[:12]:
+    parts = telegram_html_parts(answer, limit=TELEGRAM_PART_LENGTH)
+    truncated = len(parts) > MAX_SENT_PARTS
+    for part in parts[:MAX_SENT_PARTS]:
         try:
             await message.reply_text(part, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         except TelegramError:
@@ -362,6 +387,8 @@ async def send_markdown(message, answer: str) -> None:
             import html
             plain = re.sub(r"<[^>]+>", "", part)
             await message.reply_text(html.unescape(plain)[:3500])
+    if truncated:
+        await message.reply_text("⚠️ Ответ слишком длинный, отправлена только первая часть.")
 
 
 async def check_access(update: Update) -> bool:
@@ -388,7 +415,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_access(update):
         return
     await update.effective_message.reply_text(
-        "🤖 Agno AI Agent — Telegram\n\n"
+        "🤖 Agno AI Agent v3.2 — Telegram\n\n"
         "Задавай вопросы или отправь PDF/DOCX/TXT/MD/CSV (до 8 МБ). "
         "После загрузки файла я могу отвечать по его содержимому.\n\n"
         "Список команд: /help"
@@ -408,6 +435,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status — текущие настройки\n"
         "/files — мои загруженные документы\n"
         "/use 1 — выбрать документ из /files\n"
+        "/delete 1 — удалить файл и его индекс\n"
+        "/clearfiles CONFIRM — удалить все мои файлы\n"
         "/myid — мой Telegram ID\n\n"
         "Для анализа файла отправь его документом, затем напиши: «О чём этот файл?»"
     )
@@ -495,6 +524,55 @@ async def use_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"✅ Активный документ: {info.name}")
 
 
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        return
+    uid = update.effective_user.id
+    value = (context.args or [""])[0]
+    async with user_lock(uid):
+        docs = list_documents(uid)
+        if not value.isdecimal() or not 1 <= int(value) <= len(docs):
+            await update.effective_message.reply_text("Укажи номер из /files. Например: /delete 1")
+            return
+        info = docs[int(value) - 1]
+        try:
+            removed = await asyncio.to_thread(remove_document, uid, info.doc_id)
+        except Exception:
+            logger.exception("Failed to delete document metadata/index for user %s", uid)
+            await update.effective_message.reply_text(
+                "❌ Удаление не завершено. Часть данных могла сохраниться. Проверь логи сервера."
+            )
+            return
+    await update.effective_message.reply_text(
+        f"✅ Удалён документ «{info.name}»." if removed else "Документ уже не найден."
+    )
+
+
+async def clearfiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        return
+    if (context.args or []) != ["CONFIRM"]:
+        await update.effective_message.reply_text(
+            "Это удалит все твои документы, текст и индексы. Подтверди: /clearfiles CONFIRM"
+        )
+        return
+    uid = update.effective_user.id
+    removed = 0
+    failed = 0
+    async with user_lock(uid):
+        for info in list_documents(uid):
+            try:
+                if await asyncio.to_thread(remove_document, uid, info.doc_id):
+                    removed += 1
+            except Exception:
+                failed += 1
+                logger.error("Failed to clear one document for user %s", uid)
+    await update.effective_message.reply_text(
+        f"Удалено: {removed}. Не удалось удалить: {failed}."
+        + (" Повтори команду после проверки журналов." if failed else "")
+    )
+
+
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_access(update):
         return
@@ -507,10 +585,10 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with user_lock(uid):
         state = get_state(uid)
         active = get_active_document(uid, state.active_doc_id)
-        if active is None and re.search(r"\b(файл\w*|pdf|документ\w*|лекци\w*|по нему)\b", question.lower()):
+        if active is None and requests_missing_document(question):
             docs = list_documents(uid)
             await message.reply_text(
-                "В текущем диалоге нет активного файла. "
+                "Сейчас нет активного документа. "
                 + ("Выбери его через /files и /use 1." if docs else "Пришли документ в Telegram.")
             )
             return
@@ -555,10 +633,10 @@ async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Максимальный размер документа — 8 МБ.")
         return
 
-    if not sandbox_online():
+    if not await asyncio.to_thread(sandbox_online):
         await message.reply_text(
-            "🔒 Обработка файлов отключена: изолированный Docker-контейнер недоступен. "
-            "Запусти: docker compose up -d --build"
+            "🔒 Docker Desktop или образ обработчика недоступен. "
+            "Собери образ: docker compose build document-sandbox"
         )
         return
 
@@ -618,6 +696,8 @@ async def register_commands(application: Application):
         BotCommand("status", "Текущий статус"),
         BotCommand("files", "Мои документы"),
         BotCommand("use", "Выбрать документ"),
+        BotCommand("delete", "Удалить документ"),
+        BotCommand("clearfiles", "Удалить все мои документы"),
         BotCommand("myid", "Мой Telegram ID"),
     ])
 
@@ -636,7 +716,8 @@ def main() -> None:
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
         .concurrent_updates(4)
-        .post_init(register_commands)
+        .post_init(post_init)
+        .post_stop(post_stop)
         .build()
     )
     app.add_handler(CommandHandler("myid", myid_command))
@@ -648,6 +729,8 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("files", files_command))
     app.add_handler(CommandHandler("use", use_command))
+    app.add_handler(CommandHandler("delete", delete_command))
+    app.add_handler(CommandHandler("clearfiles", clearfiles_command))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Document.ALL, document_message))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.COMMAND, unknown_command))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_message))

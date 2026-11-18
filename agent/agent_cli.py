@@ -54,7 +54,7 @@ def main() -> int:
     if not API_KEY:
         console.print("[red]В agent/.env не указан OPENROUTER_API_KEY[/red]")
         return 1
-    console.print(Panel("AI Agent PRO v3.1 | Agno + OpenRouter + RAG\n/help — команды", title="Готов к работе"))
+    console.print(Panel("AI Agent PRO v3.2 | Agno + OpenRouter + RAG\n/help — команды", title="Готов к работе"))
     try:
         with console.status("Открываю базу знаний CLI..."):
             knowledge = create_knowledge()

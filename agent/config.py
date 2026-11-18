@@ -55,3 +55,13 @@ def parse_telegram_ids(raw: str) -> frozenset[int]:
 
 
 TELEGRAM_OWNER_IDS = parse_telegram_ids(os.getenv("TELEGRAM_OWNER_ID", ""))
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    if not raw.isascii() or not raw.isdecimal():
+        raise ValueError(f"{name} должен быть целым неотрицательным числом")
+    return int(raw)
+
+
+DOCUMENT_RETENTION_DAYS = _nonnegative_int_env("DOCUMENT_RETENTION_DAYS", 30)

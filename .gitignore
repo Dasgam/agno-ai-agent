@@ -12,3 +12,5 @@ __pycache__/
 agent/data/
 agent/documents/*
 !agent/documents/.gitkeep
+
+.pytest_cache/

@@ -33,7 +33,8 @@ def create_agent(knowledge, session_id: str, model_id: str = DEFAULT_MODEL, *, d
     )
     return Agent(
         model=model,
-        db=DB,
+        # Never persist extracted document excerpts in the general chat SQLite DB.
+        db=None if document_mode else DB,
         session_id=session_id,
         knowledge=knowledge,
         search_knowledge=bool(knowledge) and not document_mode,
@@ -47,8 +48,8 @@ def create_agent(knowledge, session_id: str, model_id: str = DEFAULT_MODEL, *, d
         ],
         description="AI-ассистент на русском языке с RAG, веб-поиском и финансовыми данными.",
         instructions=INSTRUCTIONS,
-        add_history_to_context=True,
-        num_history_runs=HISTORY_RUNS,
+        add_history_to_context=not document_mode,
+        num_history_runs=0 if document_mode else HISTORY_RUNS,
         add_datetime_to_context=True,
         markdown=True,
     )
